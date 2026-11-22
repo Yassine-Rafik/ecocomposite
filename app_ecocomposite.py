@@ -611,66 +611,96 @@ with st.sidebar:
     st.divider()
     st.subheader("🧬 Paramètres Métaheuristiques")
     algo_choice = st.radio("Algorithme", ["Comparaison GA vs PSO", "PSO uniquement", "GA uniquement"])
-    pop_size = st.slider("Taille population / essaim", 40, 200, 100, 20)
-    n_iter = st.slider("Nombre d'itérations / générations", 30, 150, 100, 10)
-    n_runs = st.slider("Lancements indépendants (robustesse)", 1, 10, 5, 1)
+    pop_size = st.slider("Taille population / essaim", 40, 200, 60, 20)
+    n_iter = st.slider("Nombre d'itérations / générations", 30, 150, 80, 10)
+    n_runs = st.slider("Lancements indépendants (robustesse)", 1, 10, 3, 1)
 
     launch_opt = st.button("🚀 Lancer l'optimisation", type="primary", use_container_width=True)
 
 # Initialisation du state au premier chargement
-ref_mats = SYM_MAP[n_jute][0]
-ref_angs = [0.0, 45.0, 90.0, -45.0, 0.0]
-ref_res = evaluate_laminate(ref_mats, ref_angs, detailed=True)
+@st.cache_data(show_spinner=False)
+def run_optimization_cached(n_jute, symmetric, force_jute_skins, w_Ex, min_Ey,
+                            min_Gxy, algo_choice, pop_size, n_iter, n_runs):
+    ref_mats = SYM_MAP[n_jute][0]
+    ref_angs = [0.0, 45.0, 90.0, -45.0, 0.0]
+    ref_res = evaluate_laminate(ref_mats, ref_angs, detailed=True)
 
-if launch_opt or "opt_result" not in st.session_state:
     lb = np.array([-90.0, -90.0, -90.0, 0.0]) if symmetric else np.array([-90.0]*5 + [0.0]*5)
     ub = np.array([ 90.0,  90.0,  90.0, 1.0]) if symmetric else np.array([ 90.0]*5 + [1.0]*5)
     obj = build_objective(ref_res, n_jute, symmetric, force_jute_skins, w_Ex, min_Ey, min_Gxy)
 
+    ga_hists, pso_hists, ga_times, pso_times = [], [], [], []
+    best_ga_sol, best_ga_fit = None, 1e9
+    best_pso_sol, best_pso_fit = None, 1e9
+
+    for r in range(n_runs):
+        if algo_choice in ("Comparaison GA vs PSO", "GA uniquement"):
+            t0 = time.perf_counter()
+            s_ga, f_ga, h_ga = run_GA(obj, lb, ub, pop_size=pop_size, n_gen=n_iter, seed=100 + r)
+            ga_times.append(time.perf_counter() - t0)
+            ga_hists.append(h_ga)
+            if f_ga < best_ga_fit:
+                best_ga_fit, best_ga_sol = f_ga, s_ga.copy()
+
+        if algo_choice in ("Comparaison GA vs PSO", "PSO uniquement"):
+            t0 = time.perf_counter()
+            s_pso, f_pso, h_pso = run_PSO(obj, lb, ub, swarm_size=pop_size, n_iter=n_iter, seed=200 + r)
+            pso_times.append(time.perf_counter() - t0)
+            pso_hists.append(h_pso)
+            if f_pso < best_pso_fit:
+                best_pso_fit, best_pso_sol = f_pso, s_pso.copy()
+
+    if best_pso_fit <= best_ga_fit:
+        winner_algo, winner_sol = "PSO", best_pso_sol
+    else:
+        winner_algo, winner_sol = "GA", best_ga_sol
+
+    opt_mats, opt_angs = decode_solution(winner_sol, n_jute, symmetric, force_jute_skins)
+    opt_res = evaluate_laminate(opt_mats, opt_angs, detailed=True)
+
+    return {
+        "ref_mats": ref_mats, "ref_angs": ref_angs, "ref_res": ref_res,
+        "opt_mats": opt_mats, "opt_angs": opt_angs, "opt_res": opt_res,
+        "winner_algo": winner_algo,
+        "ga_hists": np.array(ga_hists) if ga_hists else None,
+        "pso_hists": np.array(pso_hists) if pso_hists else None,
+        "ga_time": float(np.mean(ga_times)) if ga_times else None,
+        "pso_time": float(np.mean(pso_times)) if pso_times else None,
+        "n_iter": n_iter, "n_runs": n_runs
+    }
+
+
+current_cfg = (n_jute, symmetric, force_jute_skins, w_Ex, min_Ey, min_Gxy,
+               algo_choice, pop_size, n_iter, n_runs)
+
+# 1. Démarrage instantané : pré-charge le cas validé 40% Jute sans calcul lourd
+if "opt_result" not in st.session_state and not launch_opt:
+    def_ref_mats, def_ref_angs = [0, 1, 1, 1, 0], [0.0, 45.0, 90.0, -45.0, 0.0]
+    def_opt_mats, def_opt_angs = [0, 1, 1, 1, 0], [80.0, 10.0, -50.0, 10.0, 80.0]
+    st.session_state["opt_result"] = {
+        "ref_mats": def_ref_mats, "ref_angs": def_ref_angs,
+        "ref_res": evaluate_laminate(def_ref_mats, def_ref_angs, detailed=True),
+        "opt_mats": def_opt_mats, "opt_angs": def_opt_angs,
+        "opt_res": evaluate_laminate(def_opt_mats, def_opt_angs, detailed=True),
+        "winner_algo": "PSO / GA (Benchmark 40 % Jute pré-chargé)",
+        "ga_hists": None, "pso_hists": None,
+        "ga_time": None, "pso_time": None,
+        "n_iter": n_iter, "n_runs": n_runs,
+        "config": current_cfg
+    }
+
+# 2. Exécution des métaheuristiques uniquement au clic sur le bouton
+if launch_opt:
     with st.spinner("Exécution des métaheuristiques en cours..."):
-        ga_hists, pso_hists, ga_times, pso_times = [], [], [], []
-        best_ga_sol, best_ga_fit = None, 1e9
-        best_pso_sol, best_pso_fit = None, 1e9
-
-        for r in range(n_runs):
-            if algo_choice in ("Comparaison GA vs PSO", "GA uniquement"):
-                t0 = time.perf_counter()
-                s_ga, f_ga, h_ga = run_GA(obj, lb, ub, pop_size=pop_size, n_gen=n_iter, seed=100 + r)
-                ga_times.append(time.perf_counter() - t0)
-                ga_hists.append(h_ga)
-                if f_ga < best_ga_fit:
-                    best_ga_fit, best_ga_sol = f_ga, s_ga.copy()
-
-            if algo_choice in ("Comparaison GA vs PSO", "PSO uniquement"):
-                t0 = time.perf_counter()
-                s_pso, f_pso, h_pso = run_PSO(obj, lb, ub, swarm_size=pop_size, n_iter=n_iter, seed=200 + r)
-                pso_times.append(time.perf_counter() - t0)
-                pso_hists.append(h_pso)
-                if f_pso < best_pso_fit:
-                    best_pso_fit, best_pso_sol = f_pso, s_pso.copy()
-
-        # Sélection de la meilleure solution globale
-        if best_pso_fit <= best_ga_fit:
-            winner_algo, winner_sol = "PSO", best_pso_sol
-        else:
-            winner_algo, winner_sol = "GA", best_ga_sol
-
-        opt_mats, opt_angs = decode_solution(winner_sol, n_jute, symmetric, force_jute_skins)
-        opt_res = evaluate_laminate(opt_mats, opt_angs, detailed=True)
-
-        st.session_state["opt_result"] = {
-            "ref_mats": ref_mats, "ref_angs": ref_angs, "ref_res": ref_res,
-            "opt_mats": opt_mats, "opt_angs": opt_angs, "opt_res": opt_res,
-            "winner_algo": winner_algo,
-            "ga_hists": np.array(ga_hists) if ga_hists else None,
-            "pso_hists": np.array(pso_hists) if pso_hists else None,
-            "ga_time": float(np.mean(ga_times)) if ga_times else None,
-            "pso_time": float(np.mean(pso_times)) if pso_times else None,
-            "n_iter": n_iter, "n_runs": n_runs
-        }
+        result = run_optimization_cached(*current_cfg)
+        result["config"] = current_cfg
+        st.session_state["opt_result"] = result
 
 res_pack = st.session_state["opt_result"]
 r_ref, r_opt = res_pack["ref_res"], res_pack["opt_res"]
+
+if res_pack.get("config") != current_cfg:
+    st.warning("⚠️ Paramètres modifiés : cliquez sur **« 🚀 Lancer l'optimisation »** dans la barre latérale pour recalculer.")
 
 # --- ONGLETS PRINCIPAUX ---
 tab1, tab2, tab3 = st.tabs([
@@ -707,28 +737,36 @@ with tab1:
     col_left, col_right = st.columns([1.15, 1.0])
     with col_left:
         st.markdown("#### Courbe de convergence métaheuristique")
-        fig_conv, ax = plt.subplots(figsize=(6.5, 4.0))
-        iters = np.arange(res_pack["n_iter"] + 1)
-        if res_pack["ga_hists"] is not None:
-            m_ga, s_ga = res_pack["ga_hists"].mean(axis=0), res_pack["ga_hists"].std(axis=0)
-            ax.plot(iters, m_ga, color="#1f77b4", lw=2.2,
-                    label=f"GA (Moy: {m_ga[-1]:.3f} | {res_pack['ga_time']:.2f}s)")
-            if res_pack["n_runs"] > 1:
-                ax.fill_between(iters, m_ga - s_ga, m_ga + s_ga, color="#1f77b4", alpha=0.18)
-        if res_pack["pso_hists"] is not None:
-            m_pso, s_pso = res_pack["pso_hists"].mean(axis=0), res_pack["pso_hists"].std(axis=0)
-            ax.plot(iters, m_pso, color="#d62728", lw=2.2,
-                    label=f"PSO (Moy: {m_pso[-1]:.3f} | {res_pack['pso_time']:.2f}s)")
-            if res_pack["n_runs"] > 1:
-                ax.fill_between(iters, m_pso - s_pso, m_pso + s_pso, color="#d62728", alpha=0.18)
+        if res_pack["ga_hists"] is None and res_pack["pso_hists"] is None:
+            st.info(
+                "⚡ **Démarrage instantané :** l'architecture optimale validée "
+                "`[J(80°) / V(10°) / V(-50°) / V(10°) / J(80°)]` est pré-chargée.\n\n"
+                "Cliquez sur **« 🚀 Lancer l'optimisation »** dans la barre latérale pour "
+                "exécuter GA et/ou PSO en direct et afficher les courbes de convergence."
+            )
+        else:
+            fig_conv, ax = plt.subplots(figsize=(6.5, 4.0))
+            iters = np.arange(res_pack["n_iter"] + 1)
+            if res_pack["ga_hists"] is not None:
+                m_ga, s_ga = res_pack["ga_hists"].mean(axis=0), res_pack["ga_hists"].std(axis=0)
+                ax.plot(iters, m_ga, color="#1f77b4", lw=2.2,
+                        label=f"GA (Moy: {m_ga[-1]:.3f} | {res_pack['ga_time']:.2f}s)")
+                if res_pack["n_runs"] > 1:
+                    ax.fill_between(iters, m_ga - s_ga, m_ga + s_ga, color="#1f77b4", alpha=0.18)
+            if res_pack["pso_hists"] is not None:
+                m_pso, s_pso = res_pack["pso_hists"].mean(axis=0), res_pack["pso_hists"].std(axis=0)
+                ax.plot(iters, m_pso, color="#d62728", lw=2.2,
+                        label=f"PSO (Moy: {m_pso[-1]:.3f} | {res_pack['pso_time']:.2f}s)")
+                if res_pack["n_runs"] > 1:
+                    ax.fill_between(iters, m_pso - s_pso, m_pso + s_pso, color="#d62728", alpha=0.18)
 
-        ax.set_xlabel("Génération / Itération")
-        ax.set_ylabel("Indice de performance composite")
-        ax.grid(True, linestyle="--", alpha=0.45)
-        ax.legend()
-        plt.tight_layout()
-        st.pyplot(fig_conv)
-        plt.close(fig_conv)
+            ax.set_xlabel("Génération / Itération")
+            ax.set_ylabel("Indice de performance composite")
+            ax.grid(True, linestyle="--", alpha=0.45)
+            ax.legend()
+            plt.tight_layout()
+            st.pyplot(fig_conv)
+            plt.close(fig_conv)
 
     with col_right:
         st.markdown("#### Analyse pli par pli (Stratifié Optimisé)")
