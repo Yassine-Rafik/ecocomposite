@@ -715,13 +715,13 @@ tab1, tab2, tab3 = st.tabs([
 with tab1:
     st.subheader(f"Résultats clés — Meilleur optimum trouvé par {res_pack['winner_algo']}")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Module longitudinal Ex", f"{r_opt['Ex']:.1f} MPa",
+    c1.metric("Module Ex (MPa)", f"{r_opt['Ex']:.1f}",
               f"{(r_opt['Ex']/r_ref['Ex'] - 1)*100:+.1f} %")
-    c2.metric("Tenue Hashin σ_FPF", f"{r_opt['sigma_fpf']:.2f} MPa",
+    c2.metric("Hashin σ_FPF (MPa)", f"{r_opt['sigma_fpf']:.2f}",
               f"{(r_opt['sigma_fpf']/r_ref['sigma_fpf'] - 1)*100:+.1f} %")
-    c3.metric("Module transversal Ey", f"{r_opt['Ey']:.1f} MPa",
+    c3.metric("Module Ey (MPa)", f"{r_opt['Ey']:.1f}",
               f"{(r_opt['Ey']/r_ref['Ey'] - 1)*100:+.1f} %")
-    c4.metric("Cisaillement Gxy", f"{r_opt['Gxy']:.1f} MPa",
+    c4.metric("Cisaillement Gxy (MPa)", f"{r_opt['Gxy']:.1f}",
               f"{(r_opt['Gxy']/r_ref['Gxy'] - 1)*100:+.1f} %")
     c5.metric("Couplage B_norm", f"{r_opt['B_norm']:.5f}",
               "Symétrique (B=0)" if r_opt["B_norm"] < 1e-6 else "Asymétrique", delta_color="off")
