@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import streamlit as st
+import io
 
 # ==============================================================================
 # CONFIGURATION DE LA PAGE
@@ -348,6 +349,7 @@ from abaqus import *
 from abaqusConstants import *
 import part, material, section, assembly, step, interaction, load, mesh, job, regionToolset
 
+
 MESH_SIZE = {mesh_size}
 U_MAX = {u_max}
 
@@ -478,7 +480,105 @@ if 'Model-1' in mdb.models.keys():
 mdb.saveAs(pathName='EcoComp_Opt_Abaqus.cae')
 print('Modele EcoComp_Opt_Abaqus.cae pret avec sortie F-Output-Plies sur tous les plis.')
 """
+def generate_extraction_script(h_total_mm):
+    area_mm2 = 13.0 * h_total_mm
+    return f"""# -*- coding: utf-8 -*-
+# Script d'extraction automatique genere par EcoComp-Opt (Streamlit DSS)
+# Compatible Abaqus 6.14 (Python 2.7) a Abaqus 2024 (Python 3) — sans lignes vides
+from __future__ import print_function
+import sys
+import csv
+from odbAccess import openOdb
 
+H_TOTAL_MM = {h_total_mm:.2f}
+AREA_MM2 = 13.0 * H_TOTAL_MM   # Section utile ASTM D638 : 13 mm x {h_total_mm:.2f} mm = {area_mm2:.2f} mm2
+L_EFF_MM = 115.0               # Longueur entre mors (mm)
+
+def analyze_odb(odb_name):
+    odb = openOdb(path=odb_name, readOnly=True)
+    step = odb.steps['Step-Traction']
+
+    u1_data, rf1_data = None, None
+    for reg in step.historyRegions.values():
+        keys = reg.historyOutputs.keys()
+        if 'RF1' in keys and 'U1' in keys:
+            u1_data = reg.historyOutputs['U1'].data
+            rf1_data = reg.historyOutputs['RF1'].data
+            break
+
+    times = [pt[0] for pt in u1_data]
+    strains_pct = [(pt[1] / L_EFF_MM) * 100.0 for pt in u1_data]
+    stresses_mpa = [pt[1] / AREA_MM2 for pt in rf1_data]
+    E_abaqus = stresses_mpa[-1] / max(1e-9, strains_pct[-1] / 100.0)
+
+    hashin_vars = ('HSNFTCRT', 'HSNFCCRT', 'HSNMTCRT', 'HSNMCCRT')
+    fpf_stress, fpf_strain, fpf_mode = None, None, None
+    prev_max, prev_sig, prev_eps = 0.0, 0.0, 0.0
+
+    for idx, frame in enumerate(step.frames):
+        t_cur = frame.frameValue
+        k = min(range(len(times)), key=lambda i: abs(times[i] - t_cur))
+        sig_cur, eps_cur = stresses_mpa[k], strains_pct[k]
+
+        frame_max, frame_mode = 0.0, ''
+        for hv in hashin_vars:
+            if hv in frame.fieldOutputs.keys():
+                vals = frame.fieldOutputs[hv].values
+                if vals:
+                    m_val = max(v.data for v in vals)
+                    if m_val > frame_max:
+                        frame_max, frame_mode = m_val, hv
+
+        if fpf_stress is None and frame_max >= 1.0 and idx > 0:
+            frac = (1.0 - prev_max) / max(1e-9, frame_max - prev_max)
+            fpf_stress = prev_sig + frac * (sig_cur - prev_sig)
+            fpf_strain = prev_eps + frac * (eps_cur - prev_eps)
+            fpf_mode = frame_mode
+            break
+
+        prev_max, prev_sig, prev_eps = frame_max, sig_cur, eps_cur
+
+    last_frame = step.frames[-1]
+    s11_vals = [v.data[0] for v in last_frame.fieldOutputs['S'].values]
+    max_s11 = max(s11_vals) if s11_vals else 0.0
+
+    odb.close()
+    return {{
+        'strains_pct': strains_pct, 'stresses_mpa': stresses_mpa,
+        'E_abaqus': E_abaqus, 'fpf_stress': fpf_stress,
+        'fpf_strain': fpf_strain, 'fpf_mode': fpf_mode, 'max_s11': max_s11
+    }}
+
+res_ref = analyze_odb('Job_HFRC_Ref.odb')
+res_opt = analyze_odb('Job_HFRC_Opt.odb')
+
+print('=' * 78)
+print('RESULTATS VALIDATION ABAQUS (S4R 0.5 mm | H = %.2f mm | A = %.2f mm2)' % (H_TOTAL_MM, AREA_MM2))
+print('=' * 78)
+for name, r in [('HFRC_Ref', res_ref), ('HFRC_Opt', res_opt)]:
+    print('%s | E_app = %.1f MPa | Hashin FPF = %s MPa (a %s%%, %s) | Max S11 = %.1f MPa' % (
+        name, r['E_abaqus'],
+        '%.2f' % r['fpf_stress'] if r['fpf_stress'] else 'Non atteint',
+        '%.2f' % r['fpf_strain'] if r['fpf_strain'] else '-',
+        r['fpf_mode'] or '-', r['max_s11']
+    ))
+
+# Export CSV propre (sans lignes vides en Python 2.7 comme en Python 3)
+f = open('abaqus_curves.csv', 'wb') if sys.version_info[0] < 3 else open('abaqus_curves.csv', 'w', newline='')
+try:
+    writer = csv.writer(f)
+    writer.writerow(['Ref_Strain_pct', 'Ref_Stress_MPa', 'Opt_Strain_pct', 'Opt_Stress_MPa'])
+    n_rows = min(len(res_ref['strains_pct']), len(res_opt['strains_pct']))
+    for i in range(n_rows):
+        writer.writerow([
+            round(res_ref['strains_pct'][i], 6), round(res_ref['stresses_mpa'][i], 6),
+            round(res_opt['strains_pct'][i], 6), round(res_opt['stresses_mpa'][i], 6)
+        ])
+finally:
+    f.close()
+
+print('Fichier abaqus_curves.csv exporte avec succes (pret a etre importe dans EcoComp-Opt).')
+"""
 
 # ==============================================================================
 # 5. INTERFACE UTILISATEUR STREAMLIT
@@ -717,17 +817,24 @@ with tab2:
 # ==============================================================================
 with tab3:
     st.subheader("Pont automatique vers Abaqus/CAE (S4R 0,5 mm — ASTM D638)")
-    c_exp1, c_exp2 = st.columns(2)
+    st.caption(
+        "Workflow complet : **1.** Exécutez le script modèle dans Abaqus → "
+        "**2.** Soumettez `Job_HFRC_Ref` et `Job_HFRC_Opt` → "
+        "**3.** Exécutez le script d'extraction pour générer `abaqus_curves.csv` → "
+        "**4.** Importez le CSV ci-dessous."
+    )
 
     abaqus_code = generate_abaqus_script(
         res_pack["ref_mats"], res_pack["ref_angs"],
         res_pack["opt_mats"], res_pack["opt_angs"]
     )
+    extract_code = generate_extraction_script(r_opt["H"])
     csv_summary = pd.DataFrame(r_opt["ply_details"]).to_csv(index=False, sep=";").encode("utf-8-sig")
 
+    c_exp1, c_exp2, c_exp3 = st.columns(3)
     with c_exp1:
         st.download_button(
-            label="📥 Télécharger le script Abaqus (.py)",
+            label="📥 1. Script Modèle Abaqus (.py)",
             data=abaqus_code.encode("utf-8"),
             file_name="simulation_abaqus_ecocomp_opt.py",
             mime="text/x-python",
@@ -736,46 +843,105 @@ with tab3:
         )
     with c_exp2:
         st.download_button(
-            label="📄 Télécharger le tableau des plis (.csv)",
+            label="📊 2. Script Extraction CSV (.py)",
+            data=extract_code.encode("utf-8"),
+            file_name="extract_abaqus_results.py",
+            mime="text/x-python",
+            use_container_width=True
+        )
+    with c_exp3:
+        st.download_button(
+            label="📄 3. Tableau des plis (.csv)",
             data=csv_summary,
             file_name="recap_stratifies_ecocomp.csv",
             mime="text/csv",
             use_container_width=True
         )
 
-    with st.expander("Voir l'aperçu du script Python Abaqus généré"):
-        st.code(abaqus_code, language="python")
+    with st.expander("Voir l'aperçu des scripts Python Abaqus générés"):
+        sub_t1, sub_t2 = st.tabs(["simulation_abaqus_ecocomp_opt.py", "extract_abaqus_results.py"])
+        with sub_t1:
+            st.code(abaqus_code, language="python")
+        with sub_t2:
+            st.code(extract_code, language="python")
 
     st.divider()
-    st.subheader("Validation croisée avec les courbes Abaqus (abaqus_curves.csv)")
-    csv_path = "abaqus_curves.csv"
-    if os.path.exists(csv_path):
-        eps_r, sig_r, eps_o, sig_o = [], [], [], []
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            for row in reader:
-                if row and len(row) >= 4:
-                    eps_r.append(float(row[0]))
-                    sig_r.append(float(row[1]))
-                    eps_o.append(float(row[2]))
-                    sig_o.append(float(row[3]))
+    st.subheader("Validation croisée : CLT temps réel vs Abaqus (S4R 0,5 mm)")
 
-        fig_abq, ax = plt.subplots(figsize=(8.5, 4.2))
-        ax.plot(eps_r, sig_r, color="#555555", lw=2.2, label="Abaqus HFRC Réf. (E = 2173 MPa | FPF = 16,63 MPa)")
-        ax.plot(eps_o, sig_o, color="#d62728", lw=2.2, label="Abaqus HFRC Opt. (E = 3095 MPa | FPF = 30,55 MPa)")
-        ax.scatter([0.77], [16.63], color="#555555", s=80, zorder=5, edgecolor="black")
-        ax.scatter([0.99], [30.55], color="#d62728", s=85, zorder=5, marker="s", edgecolor="black")
-        ax.set_xlim(0, 2.0)
-        ax.set_ylim(0, 65)
-        ax.set_xlabel("Déformation axiale globale (%)")
-        ax.set_ylabel("Contrainte nominale (MPa)")
-        ax.set_title("Courbes extraites d'Abaqus/Standard (S4R 0,5 mm — ASTM D638)")
-        ax.grid(True, linestyle="--", alpha=0.45)
-        ax.legend()
-        plt.tight_layout()
-        st.pyplot(fig_abq)
-        plt.close(fig_abq)
-        st.success("Fichier `abaqus_curves.csv` détecté et chargé automatiquement.")
-    else:
-        st.info("Placez `abaqus_curves.csv` dans le même dossier pour afficher ici la courbe de validation Abaqus.")
+    uploaded_csv = st.file_uploader(
+        "Importer un fichier abaqus_curves.csv généré par le script d'extraction (optionnel)",
+        type=["csv"],
+        help="Remplace les courbes Abaqus par défaut (40 % Jute) par vos propres résultats FEA."
+    )
+    show_clt_live = st.checkbox(
+        "Superposer la prédiction CLT de l'optimisation courante", value=True
+    )
+
+    eps_r, sig_r, eps_o, sig_o = [], [], [], []
+    source_label = None
+    lines = None
+
+    if uploaded_csv is not None:
+        lines = io.StringIO(uploaded_csv.getvalue().decode("utf-8"))
+        source_label = f"Fichier importé : `{uploaded_csv.name}`"
+    elif os.path.exists("abaqus_curves.csv"):
+        lines = open("abaqus_curves.csv", "r", encoding="utf-8")
+        source_label = "Fichier de référence `abaqus_curves.csv` (40 % Jute) chargé automatiquement."
+
+    if lines is not None:
+        reader = csv.reader(lines)
+        next(reader, None)
+        for row in reader:
+            if row and len(row) >= 4:
+                eps_r.append(float(row[0]))
+                sig_r.append(float(row[1]))
+                eps_o.append(float(row[2]))
+                sig_o.append(float(row[3]))
+        if uploaded_csv is None:
+            lines.close()
+
+    fig_abq, ax = plt.subplots(figsize=(8.8, 4.4))
+
+    if eps_r:
+        if uploaded_csv is None:
+            lbl_r = "Abaqus Réf. 40% Jute (E = 2173 MPa | FPF = 16,63 MPa)"
+            lbl_o = "Abaqus Opt. 40% Jute (E = 3095 MPa | FPF = 30,55 MPa)"
+        else:
+            e_r_calc = sig_r[-1] / max(1e-9, eps_r[-1] / 100.0)
+            e_o_calc = sig_o[-1] / max(1e-9, eps_o[-1] / 100.0)
+            lbl_r = f"Abaqus Réf. importé (E_app = {e_r_calc:.0f} MPa)"
+            lbl_o = f"Abaqus Opt. importé (E_app = {e_o_calc:.0f} MPa)"
+
+        ax.plot(eps_r, sig_r, color="#7f7f7f", lw=2.0, label=lbl_r)
+        ax.plot(eps_o, sig_o, color="#d62728", lw=2.2, label=lbl_o)
+
+        if uploaded_csv is None:
+            ax.scatter([0.77], [16.63], color="#7f7f7f", s=70, zorder=5, edgecolor="black")
+            ax.scatter([0.99], [30.55], color="#d62728", s=75, zorder=5, marker="s", edgecolor="black")
+
+    if show_clt_live:
+        eps_clt = np.linspace(0.0, 2.0, 100)
+        sig_clt_opt = r_opt["Ex"] * (eps_clt / 100.0)
+        eps_fpf_clt = (r_opt["sigma_fpf"] / r_opt["Ex"]) * 100.0
+        jute_cur = int(round(r_opt["jute_pct"]))
+
+        ax.plot(eps_clt, sig_clt_opt, color="#1f77b4", lw=2.4, ls="--",
+                label=f"CLT Courant — {jute_cur}% Jute Opt. (Ex = {r_opt['Ex']:.0f} MPa | FPF = {r_opt['sigma_fpf']:.1f} MPa)")
+        if eps_fpf_clt <= 2.0:
+            ax.scatter([eps_fpf_clt], [r_opt["sigma_fpf"]],
+                       color="#1f77b4", s=85, zorder=6, marker="D", edgecolor="black")
+
+    ax.set_xlim(0, 2.0)
+    max_y = max(65.0, min(250.0, r_opt["Ex"] * 0.02 * 1.1)) if show_clt_live else 65.0
+    ax.set_ylim(0, max_y)
+    ax.set_xlabel("Déformation axiale globale (%)")
+    ax.set_ylabel("Contrainte nominale (MPa)")
+    ax.set_title("Corrélation FEA (Abaqus S4R 0,5 mm) & Modèle CLT en temps réel")
+    ax.grid(True, linestyle="--", alpha=0.45)
+    ax.legend(fontsize=8.8)
+    plt.tight_layout()
+    st.pyplot(fig_abq)
+    plt.close(fig_abq)
+
+    if source_label:
+        st.success(source_label)
